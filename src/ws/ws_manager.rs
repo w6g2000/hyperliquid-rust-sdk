@@ -5,7 +5,7 @@ use crate::{
     UserNonFundingLedgerUpdates, WebData2,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::BorrowMut,
@@ -29,9 +29,10 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use ethers::types::H160;
-
 use super::ActiveSpotAssetCtx;
+use crate::Error::Websocket;
+use ethers::types::H160;
+use futures_util::stream::SplitStream;
 
 #[derive(Debug)]
 struct SubscriptionData {
@@ -105,12 +106,12 @@ pub(crate) struct Ping {
 }
 
 impl WsManager {
-    const SEND_PING_INTERVAL: u64 = 50;
+    const SEND_PING_INTERVAL: u64 = 30;
 
     pub(crate) async fn new(url: String, reconnect: bool) -> Result<WsManager> {
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let (writer, mut reader) = Self::connect(&url).await?.split();
+        let (writer, reader) = Self::connect(&url).await?.split();
         let writer = Arc::new(Mutex::new(writer));
 
         let subscriptions_map: HashMap<String, Vec<SubscriptionData>> = HashMap::new();
@@ -120,92 +121,125 @@ impl WsManager {
         {
             let writer = writer.clone();
             let stop_flag = Arc::clone(&stop_flag);
-            let reader_fut = async move {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    if let Some(data) = reader.next().await {
-                        if let Err(err) =
-                            WsManager::parse_and_send_data(data, &subscriptions_copy).await
-                        {
-                            error!("Error processing data received by WsManager reader: {err}");
-                        }
-                    } else {
-                        warn!("WsManager disconnected");
-                        if let Err(err) = WsManager::send_to_all_subscriptions(
-                            &subscriptions_copy,
-                            Message::NoData,
-                        )
-                        .await
-                        {
-                            warn!("Error sending disconnection notification err={err}");
-                        }
-                        if reconnect {
-                            // Always sleep for 1 second before attempting to reconnect so it does not spin during reconnecting. This could be enhanced with exponential backoff.
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            info!("WsManager attempting to reconnect");
-                            match Self::connect(&url).await {
-                                Ok(ws) => {
-                                    let (new_writer, new_reader) = ws.split();
-                                    reader = new_reader;
-                                    let mut writer_guard = writer.lock().await;
-                                    *writer_guard = new_writer;
-                                    for (identifier, v) in subscriptions_copy.lock().await.iter() {
-                                        // TODO should these special keys be removed and instead use the simpler direct identifier mapping?
-                                        if identifier.eq("userEvents")
-                                            || identifier.eq("orderUpdates")
-                                        {
-                                            for subscription_data in v {
-                                                if let Err(err) = Self::subscribe(
-                                                    writer_guard.deref_mut(),
-                                                    &subscription_data.id,
-                                                )
-                                                .await
-                                                {
-                                                    error!(
-                                                        "Could not resubscribe {identifier}: {err}"
-                                                    );
-                                                }
-                                            }
-                                        } else if let Err(err) =
-                                            Self::subscribe(writer_guard.deref_mut(), identifier)
-                                                .await
-                                        {
-                                            error!("Could not resubscribe correctly {identifier}: {err}");
+            let url = url.clone();
+
+            let combined_task = async move {
+                let mut reader = reader;
+                let mut ping_interval = tokio::time::interval(Duration::from_secs(Self::SEND_PING_INTERVAL));
+                ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                // 用于跟踪最后一次收到 pong 的时间
+                let mut last_pong_time = tokio::time::Instant::now();
+                let pong_timeout = Duration::from_secs(Self::SEND_PING_INTERVAL * 3); // 超时时间设为 ping 间隔的两倍
+
+                loop {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    tokio::select! {
+                        // 处理 WebSocket 消息
+                        msg = reader.next() => {
+                            match msg {
+                                Some(Ok(data)) => {
+                                    // 检查是否是 pong 消息
+                                    if let Ok(text) = data.to_text() {
+                                        if text.contains("pong") {
+                                            last_pong_time = tokio::time::Instant::now();
+                                            debug!("Received pong response");
+                                            continue;
                                         }
                                     }
-                                    info!("WsManager reconnect finished");
-                                }
-                                Err(err) => error!("Could not connect to websocket {err}"),
-                            }
-                        } else {
-                            error!("WsManager reconnection disabled. Will not reconnect and exiting reader task.");
-                            break;
-                        }
-                    }
-                }
-                warn!("ws message reader task stopped");
-            };
-            spawn(reader_fut);
-        }
 
-        {
-            let stop_flag = Arc::clone(&stop_flag);
-            let writer = Arc::clone(&writer);
-            let ping_fut = async move {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    match serde_json::to_string(&Ping { method: "ping" }) {
-                        Ok(payload) => {
-                            let mut writer = writer.lock().await;
-                            if let Err(err) = writer.send(protocol::Message::Text(payload)).await {
-                                error!("Error pinging server: {err}")
+                                    // 处理其他消息
+                                    if let Err(err) = WsManager::parse_and_send_data(Ok(data), &subscriptions_copy).await {
+                                        error!("Error processing data received by WsManager: {err}");
+                                    }
+                                }
+                                Some(Err(err)) => {
+                                    error!("WebSocket error: {err}");
+                                    // 触发重连逻辑
+                                    if let Err(err) = Self::handle_disconnection_and_reconnect(
+                                        &url,
+                                        reconnect,
+                                        &writer,
+                                        &mut reader,
+                                        &subscriptions_copy,
+                                        &mut last_pong_time,
+                                    ).await {
+                                        error!("Failed to reconnect: {err}");
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    warn!("WsManager disconnected");
+                                    // 触发重连逻辑
+                                    if let Err(err) = Self::handle_disconnection_and_reconnect(
+                                        &url,
+                                        reconnect,
+                                        &writer,
+                                        &mut reader,
+                                        &subscriptions_copy,
+                                        &mut last_pong_time,
+                                    ).await {
+                                        error!("Failed to reconnect: {err}");
+                                        break;
+                                    }
+                                }
                             }
                         }
-                        Err(err) => error!("Error serializing ping message: {err}"),
+
+                        // 定时发送 ping
+                        _ = ping_interval.tick() => {
+                            // 检查 pong 超时
+                            if tokio::time::Instant::now().duration_since(last_pong_time) > pong_timeout {
+                                warn!("Pong timeout detected, connection might be dead");
+                                // 触发重连逻辑
+                                if let Err(err) = Self::handle_disconnection_and_reconnect(
+                                    &url,
+                                    reconnect,
+                                    &writer,
+                                    &mut reader,
+                                    &subscriptions_copy,
+                                    &mut last_pong_time,
+                                ).await {
+                                    error!("Failed to reconnect after pong timeout: {err}");
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            // 发送 ping
+                            match serde_json::to_string(&Ping { method: "ping" }) {
+                                Ok(payload) => {
+                                    let mut writer_guard = writer.lock().await;
+                                    if let Err(err) = writer_guard.send(protocol::Message::Text(payload)).await {
+                                        error!("Error sending ping: {err}");
+                                        // 发送失败，触发重连
+                                        drop(writer_guard); // 释放锁
+                                        if let Err(err) = Self::handle_disconnection_and_reconnect(
+                                            &url,
+                                            reconnect,
+                                            &writer,
+                                            &mut reader,
+                                            &subscriptions_copy,
+                                            &mut last_pong_time,
+                                        ).await {
+                                            error!("Failed to reconnect after ping error: {err}");
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(err) => error!("Error serializing ping message: {err}"),
+                            }
+                        }
                     }
-                    time::sleep(Duration::from_secs(Self::SEND_PING_INTERVAL)).await;
                 }
-                warn!("ws ping task stopped");
+
+                warn!("WebSocket manager task stopped");
             };
-            spawn(ping_fut);
+
+            spawn(combined_task);
         }
 
         Ok(WsManager {
@@ -215,6 +249,72 @@ impl WsManager {
             subscription_id: 0,
             subscription_identifiers: HashMap::new(),
         })
+    }
+
+    async fn handle_disconnection_and_reconnect(
+        url: &str,
+        reconnect: bool,
+        writer: &Arc<
+            Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>>,
+        >,
+        reader: &mut SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+        subscriptions: &Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
+        last_pong_time: &mut tokio::time::Instant,
+    ) -> Result<()> {
+        // 通知所有订阅者连接已断开
+        if let Err(err) = WsManager::send_to_all_subscriptions(subscriptions, Message::NoData).await
+        {
+            warn!("Error sending disconnection notification: {err}");
+        }
+
+        if !reconnect {
+            error!("WsManager reconnection disabled. Will not reconnect.");
+            return Err(Websocket("Reconnection disabled".to_string()));
+        }
+
+        // 重连循环
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            info!("WsManager attempting to reconnect");
+
+            match Self::connect(url).await {
+                Ok(ws) => {
+                    let (new_writer, new_reader) = ws.split();
+                    *reader = new_reader;
+
+                    let mut writer_guard = writer.lock().await;
+                    *writer_guard = new_writer;
+
+                    // 重新订阅
+                    for (identifier, v) in subscriptions.lock().await.iter() {
+                        if identifier.eq("userEvents") || identifier.eq("orderUpdates") {
+                            for subscription_data in v {
+                                if let Err(err) =
+                                    Self::subscribe(writer_guard.deref_mut(), &subscription_data.id)
+                                        .await
+                                {
+                                    error!("Could not resubscribe {identifier}: {err}");
+                                }
+                            }
+                        } else if let Err(err) =
+                            Self::subscribe(writer_guard.deref_mut(), identifier).await
+                        {
+                            error!("Could not resubscribe {identifier}: {err}");
+                        }
+                    }
+
+                    // 重置 pong 时间
+                    *last_pong_time = tokio::time::Instant::now();
+
+                    info!("WsManager reconnect finished");
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!("Could not reconnect to websocket: {err}");
+                    // 继续重试
+                }
+            }
+        }
     }
 
     async fn connect(url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
