@@ -5,7 +5,7 @@ use crate::{
     UserNonFundingLedgerUpdates, WebData2,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::BorrowMut,
@@ -146,7 +146,7 @@ impl WsManager {
                                     if let Ok(text) = data.to_text() {
                                         if text.contains("pong") {
                                             last_pong_time = tokio::time::Instant::now();
-                                            debug!("Received pong response");
+                                            trace!("Received pong response");
                                             continue;
                                         }
                                     }
